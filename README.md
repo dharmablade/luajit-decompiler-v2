@@ -23,3 +23,5 @@ Feel free to [report any issues](https://github.com/marsinator358/luajit-decompi
 
 This project uses an boolean expression decompilation algorithm that is based on this paper:  
 [www.cse.iitd.ac.in/~sak/reports/isec2016-paper.pdf](https://www.cse.iitd.ac.in/~sak/reports/isec2016-paper.pdf)
+
+WARNING: This is a vibecoded Linux fork of marsinator358's project. No functional changes were made to the project.

@@ -10,10 +10,6 @@ private:
 		NUMBER_CONSTANT
 	};
 
-	struct Local;
-	struct SlotScope;
-	struct ConditionBuilder;
-
 public:
 	struct Expression;
 	struct Constant;
@@ -24,8 +20,12 @@ public:
 	struct UnaryOperation;
 	struct Statement;
 	struct Function;
+	struct Local;
+	struct SlotScope;
+	struct ConditionBuilder;
 	#include "building_blocks.h"
 	#include "function.h"
+	#include "conditionBuilder.h"
 
 	Ast(const Bytecode& bytecode, const bool& ignoreDebugInfo, const bool& minimizeDiffs);
 	~Ast();
@@ -35,8 +35,6 @@ public:
 	Function* chunk = nullptr;
 
 private:
-
-	#include "conditionBuilder.h";
 
 	struct BlockInfo {
 		uint32_t index = INVALID_ID;

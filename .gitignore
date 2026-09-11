@@ -179,6 +179,10 @@ DocProject/Help/html
 # Click-Once directory
 publish/
 
+output/
+
+luajit-decompiler-v2
+
 # Publish Web Output
 *.[Pp]ublish.xml
 *.azurePubxml
@@ -399,3 +403,4 @@ FodyWeavers.xsd
 
 *.sln
 *.vcxproj*
+*.o

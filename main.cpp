@@ -1,4 +1,7 @@
 #include "main.h"
+#include <climits>
+#include <csignal>
+#include <libgen.h>
 
 struct Error {
 	const std::string message;
@@ -8,9 +11,6 @@ struct Error {
 	const std::string line;
 };
 
-static const HANDLE CONSOLE_OUTPUT = GetStdHandle(STD_OUTPUT_HANDLE);
-//static const HANDLE CONSOLE_INPUT = GetStdHandle(STD_INPUT_HANDLE);
-static bool isCommandLine;
 static bool isProgressBarActive = false;
 static uint32_t filesSkipped = 0;
 
@@ -32,6 +32,46 @@ struct Directory {
 	std::vector<std::string> files;
 };
 
+std::string path_find_extension(const std::string& filename) {
+	size_t pos = filename.rfind('.');
+	if (pos == std::string::npos) return "";
+	return filename.substr(pos);
+}
+
+std::string path_remove_extension(const std::string& filename) {
+	size_t pos = filename.rfind('.');
+	if (pos == std::string::npos) return filename;
+	return filename.substr(0, pos);
+}
+
+std::string path_find_filename(const std::string& path) {
+	size_t pos = path.find_last_of("/\\");
+	if (pos == std::string::npos) return path;
+	return path.substr(pos + 1);
+}
+
+bool path_is_directory(const std::string& path) {
+	struct stat st;
+	if (stat(path.c_str(), &st) != 0) return false;
+	return S_ISDIR(st.st_mode);
+}
+
+bool path_exists(const std::string& path) {
+	struct stat st;
+	return stat(path.c_str(), &st) == 0;
+}
+
+std::string get_executable_dir() {
+	char buf[PATH_MAX];
+	ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+	if (len == -1) return "./";
+	buf[len] = '\0';
+	std::string exePath(buf);
+	size_t pos = exePath.find_last_of('/');
+	if (pos == std::string::npos) return "./";
+	return exePath.substr(0, pos + 1);
+}
+
 static std::string string_to_lowercase(const std::string& string) {
 	std::string lowercaseString = string;
 
@@ -44,34 +84,36 @@ static std::string string_to_lowercase(const std::string& string) {
 }
 
 static void find_files_recursively(Directory& directory) {
-	WIN32_FIND_DATAA pathData;
-	HANDLE handle = FindFirstFileA((arguments.inputPath + directory.path + '*').c_str(), &pathData);
-	if (handle == INVALID_HANDLE_VALUE) return;
+	DIR* dir = opendir((arguments.inputPath + directory.path).c_str());
+	if (!dir) return;
 
-	do {
-		if (pathData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-			if (!std::strcmp(pathData.cFileName, ".") || !std::strcmp(pathData.cFileName, "..")) continue;
-			directory.folders.emplace_back(Directory{ .path = directory.path + pathData.cFileName + "\\" });
+	struct dirent* entry;
+	while ((entry = readdir(dir)) != nullptr) {
+		std::string name = entry->d_name;
+		if (name == "." || name == "..") continue;
+
+		std::string fullPath = arguments.inputPath + directory.path + name;
+
+		if (path_is_directory(fullPath)) {
+			directory.folders.emplace_back(Directory{ .path = directory.path + name + "/" });
 			find_files_recursively(directory.folders.back());
 			if (!directory.folders.back().files.size() && !directory.folders.back().folders.size()) directory.folders.pop_back();
 			continue;
 		}
 
-		if (!arguments.extensionFilter.size() || arguments.extensionFilter == string_to_lowercase(PathFindExtensionA(pathData.cFileName))) directory.files.emplace_back(pathData.cFileName);
-	} while (FindNextFileA(handle, &pathData));
+		if (!arguments.extensionFilter.size() || arguments.extensionFilter == string_to_lowercase(path_find_extension(name)))
+			directory.files.emplace_back(name);
+	}
 
-	FindClose(handle);
+	closedir(dir);
 }
 
 static bool decompile_files_recursively(const Directory& directory) {
-	CreateDirectoryA((arguments.outputPath + directory.path).c_str(), NULL);
+	mkdir((arguments.outputPath + directory.path).c_str(), 0755);
 	std::string outputFile;
 
 	for (uint32_t i = 0; i < directory.files.size(); i++) {
-		outputFile = directory.files[i];
-		PathRemoveExtensionA(outputFile.data());
-		outputFile = outputFile.c_str();
-		outputFile += ".lua";
+		outputFile = path_remove_extension(directory.files[i]) + ".lua";
 
 		Bytecode bytecode(arguments.inputPath + directory.path + directory.files[i]);
 		Ast ast(bytecode, arguments.ignoreDebugInfo, arguments.minimizeDiffs);
@@ -94,20 +136,26 @@ static bool decompile_files_recursively(const Directory& directory) {
 				continue;
 			}
 
-			switch (MessageBoxA(NULL, ("Error running " + error.function + "\nSource: " + error.source + ":" + error.line + "\n\nFile: " + error.filePath + "\n\n" + error.message).c_str(),
-				PROGRAM_NAME, MB_ICONERROR | MB_CANCELTRYCONTINUE | MB_DEFBUTTON3)) {
-			case IDCANCEL:
+			fprintf(stderr, "\nError running %s\nSource: %s:%s\n\nFile: %s\n\n%s\n",
+				error.function.c_str(), error.source.c_str(), error.line.c_str(),
+				error.filePath.c_str(), error.message.c_str());
+
+			fprintf(stderr, "\nOptions: [s]kip file, [r]etry, [q]uit: ");
+			int ch = getchar();
+			if (ch != EOF) { while (getchar() != '\n' && ch != EOF); }
+
+			if (ch == 'q' || ch == 'Q') {
 				return false;
-			case IDTRYAGAIN:
+			} else if (ch == 'r' || ch == 'R') {
 				print("Retrying...");
 				i--;
 				continue;
-			case IDCONTINUE:
+			} else {
 				print("File skipped.");
 				filesSkipped++;
 			}
 		} catch (...) {
-			MessageBoxA(NULL, std::string("Unknown exception\n\nFile: " + bytecode.filePath).c_str(), PROGRAM_NAME, MB_ICONERROR | MB_OK);
+			fprintf(stderr, "Unknown exception\n\nFile: %s\n", bytecode.filePath.c_str());
 			throw;
 		}
 	}
@@ -122,9 +170,6 @@ static bool decompile_files_recursively(const Directory& directory) {
 static char* parse_arguments(const int& argc, char** const& argv) {
 	if (argc < 2) return nullptr;
 	arguments.inputPath = argv[1];
-#ifndef _DEBUG
-	if (!isCommandLine) return nullptr;
-#endif
 	bool isInputPathSet = true;
 
 	if (arguments.inputPath.size() && arguments.inputPath.front() == '-') {
@@ -213,30 +258,7 @@ static char* parse_arguments(const int& argc, char** const& argv) {
 	return nullptr;
 }
 
-static void wait_for_exit() {
-	if (isCommandLine) return;
-	print("Press any key to exit.");
-
-	while (!_kbhit()) {
-		Sleep(0);
-	};
-}
-
 int main(int argc, char* argv[]) {
-	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
-
-	{
-		HWND window = GetConsoleWindow();
-		DWORD consoleProcessId;
-		GetWindowThreadProcessId(window, &consoleProcessId);
-#ifdef _DEBUG
-		isCommandLine = false;
-#else
-		isCommandLine = consoleProcessId != GetCurrentProcessId();
-		if (!isCommandLine) SetWindowTextA(window, PROGRAM_NAME);
-#endif
-	}
-
 	print(std::string(PROGRAM_NAME) + "\nCompiled on " + __DATE__);
 	
 	if (parse_arguments(argc, argv)) {
@@ -246,7 +268,7 @@ int main(int argc, char* argv[]) {
 	
 	if (arguments.showHelp) {
 		print(
-			"Usage: luajit-decompiler-v2.exe INPUT_PATH [options]\n"
+			"Usage: luajit-decompiler-v2 INPUT_PATH [options]\n"
 			"\n"
 			"Available options:\n"
 			"  -h, -?, --help\t\tShow this message\n"
@@ -264,55 +286,27 @@ int main(int argc, char* argv[]) {
 	
 	if (!arguments.inputPath.size()) {
 		print("No input path specified!");
-		if (isCommandLine) return EXIT_FAILURE;
-		arguments.inputPath.resize(MAX_PATH, NULL);
-		OPENFILENAMEA dialogInfo = {
-			.lStructSize = sizeof(OPENFILENAMEA),
-			.hwndOwner = NULL,
-			.lpstrFilter = NULL,
-			.lpstrCustomFilter = NULL,
-			.lpstrFile = arguments.inputPath.data(),
-			.nMaxFile = (DWORD)arguments.inputPath.size(),
-			.lpstrFileTitle = NULL,
-			.lpstrInitialDir = NULL,
-			.lpstrTitle = PROGRAM_NAME,
-			.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
-			.lpstrDefExt = NULL,
-			.FlagsEx = NULL
-		};
-		print("Please select a valid LuaJIT bytecode file.");
-		if (!GetOpenFileNameA(&dialogInfo)) return EXIT_FAILURE;
-		arguments.inputPath = arguments.inputPath.c_str();
+		return EXIT_FAILURE;
 	}
 
-	DWORD pathAttributes;
-
 	if (!arguments.outputPath.size()) {
-		arguments.outputPath.resize(MAX_PATH);
-		GetModuleFileNameA(NULL, arguments.outputPath.data(), arguments.outputPath.size());
-		*PathFindFileNameA(arguments.outputPath.data()) = '\x00';
-		arguments.outputPath = arguments.outputPath.c_str();
-		arguments.outputPath += "output\\";
-		arguments.outputPath.shrink_to_fit();
+		arguments.outputPath = get_executable_dir() + "output/";
 	} else {
-		pathAttributes = GetFileAttributesA(arguments.outputPath.c_str());
-
-		if (pathAttributes == INVALID_FILE_ATTRIBUTES) {
+		if (!path_exists(arguments.outputPath)) {
 			print("Failed to open output path: " + arguments.outputPath);
 			return EXIT_FAILURE;
 		}
 
-		if (!(pathAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+		if (!path_is_directory(arguments.outputPath)) {
 			print("Output path is not a folder!");
 			return EXIT_FAILURE;
 		}
 
 		switch (arguments.outputPath.back()) {
 		case '/':
-		case '\\':
 			break;
 		default:
-			arguments.outputPath += '\\';
+			arguments.outputPath += '/';
 			break;
 		}
 	}
@@ -322,23 +316,19 @@ int main(int argc, char* argv[]) {
 		arguments.extensionFilter = string_to_lowercase(arguments.extensionFilter);
 	}
 
-	pathAttributes = GetFileAttributesA(arguments.inputPath.c_str());
-
-	if (pathAttributes == INVALID_FILE_ATTRIBUTES) {
+	if (!path_exists(arguments.inputPath)) {
 		print("Failed to open input path: " + arguments.inputPath);
-		wait_for_exit();
 		return EXIT_FAILURE;
 	}
 
 	Directory root;
 
-	if (pathAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+	if (path_is_directory(arguments.inputPath)) {
 		switch (arguments.inputPath.back()) {
 		case '/':
-		case '\\':
 			break;
 		default:
-			arguments.inputPath += '\\';
+			arguments.inputPath += '/';
 			break;
 		}
 
@@ -346,45 +336,31 @@ int main(int argc, char* argv[]) {
 
 		if (!root.files.size() && !root.folders.size()) {
 			print("No files " + (arguments.extensionFilter.size() ? "with extension " + arguments.extensionFilter + " " : "") + "found in path: " + arguments.inputPath);
-			wait_for_exit();
 			return EXIT_FAILURE;
 		}
 	} else {
-		root.files.emplace_back(PathFindFileNameA(arguments.inputPath.c_str()));
-		*PathFindFileNameA(arguments.inputPath.c_str()) = '\x00';
-		arguments.inputPath = arguments.inputPath.c_str();
+		root.files.emplace_back(path_find_filename(arguments.inputPath));
+		arguments.inputPath = path_remove_extension(arguments.inputPath);
+		arguments.inputPath = path_find_filename(arguments.inputPath);
+		arguments.inputPath = arguments.inputPath.substr(0, arguments.inputPath.size() - path_find_filename(arguments.inputPath).size());
 	}
 
 	try {
 		if (!decompile_files_recursively(root)) {
 			print("--------------------\nAborted!");
-			wait_for_exit();
 			return EXIT_FAILURE;
 		}
 	} catch (...) {
 		throw;
 	}
 
-#ifndef _DEBUG
 	print("--------------------\n" + (filesSkipped ? "Failed to decompile " + std::to_string(filesSkipped) + " file" + (filesSkipped > 1 ? "s" : "") + ".\n" : "") + "Done!");
-	wait_for_exit();
-#endif
 	return EXIT_SUCCESS;
 }
 
 void print(const std::string& message) {
-	WriteConsoleA(CONSOLE_OUTPUT, (message + '\n').data(), message.size() + 1, NULL, NULL);
+	printf("%s\n", message.c_str());
 }
-
-/*
-std::string input() {
-	static char BUFFER[1024];
-
-	FlushConsoleInputBuffer(CONSOLE_INPUT);
-	DWORD charsRead;
-	return ReadConsoleA(CONSOLE_INPUT, BUFFER, sizeof(BUFFER), &charsRead, NULL) && charsRead > 2 ? std::string(BUFFER, charsRead - 2) : "";
-}
-*/
 
 void print_progress_bar(const double& progress, const double& total) {
 	static char PROGRESS_BAR[] = "\r[====================]";
@@ -395,7 +371,8 @@ void print_progress_bar(const double& progress, const double& total) {
 		PROGRESS_BAR[i + 2] = i < threshold ? '=' : ' ';
 	}
 
-	WriteConsoleA(CONSOLE_OUTPUT, PROGRESS_BAR, sizeof(PROGRESS_BAR) - 1, NULL, NULL);
+	printf("%s", PROGRESS_BAR);
+	fflush(stdout);
 	isProgressBarActive = true;
 }
 
@@ -403,7 +380,8 @@ void erase_progress_bar() {
 	static constexpr char PROGRESS_BAR_ERASER[] = "\r                      \r";
 
 	if (!isProgressBarActive) return;
-	WriteConsoleA(CONSOLE_OUTPUT, PROGRESS_BAR_ERASER, sizeof(PROGRESS_BAR_ERASER) - 1, NULL, NULL);
+	printf("%s", PROGRESS_BAR_ERASER);
+	fflush(stdout);
 	isProgressBarActive = false;
 }
 
